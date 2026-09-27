@@ -26,9 +26,9 @@ test('全台查詢含雨備、正確區域偏好、照片作者且不洩漏 key 
     assert.ok(plan.routes.heavy.items.filter(i=>i.place).every(i=>i.place.indoor));
     assert.ok(!text.includes('過遠景點'));assert.ok(!text.includes(env.GOOGLE_PLACES_API_KEY));assert.ok(!text.includes('photoReference'));
     assert.ok(plan.routes.sun.items.some(i=>i.place?.image?.authors[0].displayName==='測試作者'));
-    const searches=mock.calls.filter(c=>c.body);assert.equal(searches.length,3);
+    const searches=mock.calls.filter(c=>c.body);assert.equal(searches.length,5);
     assert.equal(searches[1].body.locationBias.circle.radius,15000);
-    assert.ok(mock.calls.length<=9);
+    assert.ok(mock.calls.length<=17);
     if(destination==='日月潭')assert.equal(plan.routes.sun.items.find(i=>i.place).place.id,'g-anchor');
   }
 });

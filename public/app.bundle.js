@@ -8,7 +8,7 @@ const strategies={sun:'天候穩定時採用；戶外段仍依現場狀況調整
 const maps=p=>'https://www.google.com/maps/search/?api=1&query='+encodeURIComponent(p.name+' '+p.address);
 const hm=n=>`${String(Math.floor(n/60)).padStart(2,'0')}:${String(n%60).padStart(2,'0')}`;
 const minutes=s=>{if(!/^\d{2}:\d{2}$/.test(s))throw Error('請填入正確時間。');const [h,m]=s.split(':').map(Number);if(h>23||m>59)throw Error('時間格式不正確。');return h*60+m;};
-function validate(raw){const o={...raw};for(const k of ['destination','origin']){o[k]=String(o[k]||'').trim();if(!o[k]||o[k].length>80)throw Error('請填入 1–80 字的目的地與出發地。');}if(!/^\d{4}-\d{2}-\d{2}$/.test(o.date)||!Number.isFinite(Date.parse(o.date+'T12:00:00+08:00'))||new Date(o.date+'T12:00:00Z').toISOString().slice(0,10)!==o.date)throw Error('請選擇有效旅遊日期。');for(const [k,min,max]of [['people',1,20],['budget',100,100000],['transfer',0,360]]){o[k]=Number(o[k]);if(!Number.isInteger(o[k])||o[k]<min||o[k]>max)throw Error('人數、預算或單程時間超出可用範圍。');}o.startMin=minutes(o.start);o.endMin=minutes(o.end);if(o.endMin-o.startMin<180||o.endMin-o.startMin>960)throw Error('請安排同一天至少 3 小時、至多 16 小時的旅程。');if(!['drive','transit'].includes(o.transport)||!['easy','normal'].includes(o.pace)||!['culture','nature','family'].includes(o.interest)||!['成人同行','親子同行','長輩同行'].includes(o.group))throw Error('請選擇有效的旅遊條件。');o.exclude=String(o.exclude||'').slice(0,120);return o;}
+function validate(raw){const o={...raw,days:raw.days??1};for(const k of ['destination','origin']){o[k]=String(o[k]||'').trim();if(!o[k]||o[k].length>80)throw Error('請填入 1–80 字的目的地與出發地。');}if(!/^\d{4}-\d{2}-\d{2}$/.test(o.date)||!Number.isFinite(Date.parse(o.date+'T12:00:00+08:00'))||new Date(o.date+'T12:00:00Z').toISOString().slice(0,10)!==o.date)throw Error('請選擇有效旅遊日期。');for(const [k,min,max]of [['days',1,5],['people',1,20],['budget',100,100000],['transfer',0,360]]){o[k]=Number(o[k]);if(!Number.isInteger(o[k])||o[k]<min||o[k]>max)throw Error('天數、人數、預算或單程時間超出可用範圍。');}o.startMin=minutes(o.start);o.endMin=minutes(o.end);if(o.endMin-o.startMin<180||o.endMin-o.startMin>960)throw Error('請安排同一天至少 3 小時、至多 16 小時的旅程。');if(!['drive','transit'].includes(o.transport)||!['easy','normal'].includes(o.pace)||!['culture','nature','family','shopping'].includes(o.interest)||!['成人同行','親子同行','長輩同行'].includes(o.group))throw Error('請選擇有效的旅遊條件。');o.exclude=String(o.exclude||'').slice(0,120);return o;}
 
 return {labels,strategies,maps,hm,validate};
 })();
@@ -16,7 +16,7 @@ modules["app"]=await (async()=>{
 const {labels,strategies,maps,validate}=modules["input"];
 const $=s=>document.querySelector(s),form=$('#planner'),output=$('#output'),status=$('#status');
 const config=window.TRAVEL_CONFIG||{};
-let plan=null,active='sun',revision=0,controller=null;
+let plan=null,active='sun',activeDay=0,revision=0,controller=null;
 const escape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const safeUrl=v=>{try{const u=new URL(v);return u.protocol==='https:'?u.href:'#';}catch{return '#';}};
 const link=(title,url)=>`<a href="${safeUrl(url)}" target="_blank" rel="noopener noreferrer">${escape(title)} ↗</a>`;
@@ -45,8 +45,8 @@ async function generate(){
     const response=await fetch(endpoint()+'/api/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(input),signal:abort.signal});
     let data;try{data=await response.json();}catch{throw Error('查詢服務沒有回傳有效資料，請確認 Worker 網址及部署狀態。');}
     if(!response.ok)throw Error(data.error||'地點查詢暫時無法使用，請稍後重試。');
-    if(data.sourceMode!=='live'||!data.routes?.sun||!data.input||!data.region)throw Error('查詢服務版本不相符，請更新 Worker 至全台線上版。');
-    if(current!==revision)return;plan=data;active=Object.keys(labels).find(k=>data.routes[k]?.available)||'sun';message('');render();
+    if(data.version!==3||!data.days?.length||data.sourceMode!=='live'||!data.routes?.sun||!data.input||!data.region)throw Error('查詢服務版本不相符，請更新 Worker 至全台線上版。');
+    if(current!==revision)return;plan=data;activeDay=0;active=Object.keys(labels).find(k=>data.routes[k]?.available)||'sun';message('');render();
   }catch(error){if(current!==revision)return;const detail=abort.signal.reason==='timeout'?'查詢逾時，請稍後再試。':error instanceof TypeError?'無法連線到查詢服務，請檢查網路、Worker 網址及允許來源設定。':error.message;empty('這次尚未產生行程','請查看上方提示，調整條件或完成線上服務設定後再試。');message(detail,true);
   }finally{clearTimeout(timer);if(current===revision){$('#generate').disabled=false;controller=null;}}
 }
@@ -55,15 +55,16 @@ function photograph(p){
   if(!p.image?.url)return '<p class="photo-note">此景點暫無可顯示的實景照片，可開啟 Google Maps 查看。</p>';
   return `<figure class="place-image"><img class="stop-photo" loading="lazy" src="${safeUrl(p.image.url)}" alt="${escape(p.name)}實景照片"><figcaption><span translate="no">Google Maps</span> · ${(p.image.authors||[]).map(a=>link(a.displayName||'照片作者',a.uri)).join(' · ')||'由地點服務提供'} ${link('查看地點',p.mapUrl||maps(p))}</figcaption></figure>`;
 }
-function render(){const r=plan.routes[active],o=plan.input;
-  output.innerHTML=`<div class="route-cover"><div class="cover-content"><p class="eyebrow">TAIWAN / LIVE SEARCH</p><h2>${escape(plan.region.city)}一日遊</h2><p>${escape(o.date)} ${new Date(o.date+'T12:00:00+08:00').toLocaleDateString('zh-TW',{weekday:'long',timeZone:'Asia/Taipei'})} · ${o.people} 人 · ${escape(o.group)}</p><p>${escape(plan.resolvedLocation?.name||'')} ${escape(plan.resolvedLocation?.address||'')}</p></div></div>
-  <div class="summary"><div><small>景點安排</small><strong>${r.items.filter(i=>i.place).length} 站</strong></div><div><small>預估返家</small><strong>${escape(r.finish||'尚無路線')}</strong></div><div><small>預留金額・非報價</small><strong>${r.available?'NT$ '+r.total.toLocaleString():'—'}</strong></div></div>
+function render(){const day=plan.days[activeDay],r=day.routes[active],o=plan.input;
+  output.innerHTML=`<div class="route-cover"><div class="cover-content"><p class="eyebrow">TAIWAN / LIVE SEARCH</p><h2>${escape(plan.region.city)}${o.days===1?'一日遊':o.days+' 日遊'}</h2><p>${escape(day.date)} ${new Date(day.date+'T12:00:00+08:00').toLocaleDateString('zh-TW',{weekday:'long',timeZone:'Asia/Taipei'})} · ${o.people} 人 · ${escape(o.group)}</p><p>${escape(plan.resolvedLocation?.name||'')} ${escape(plan.resolvedLocation?.address||'')}</p></div></div>
+  <div class="summary"><div><small>景點安排</small><strong>${r.items.filter(i=>i.place).length} 站</strong></div><div><small>本日結束</small><strong>${escape(r.finish||'尚無路線')}</strong></div><div><small>預留金額・非報價</small><strong>${r.available?'NT$ '+r.total.toLocaleString():'—'}</strong></div></div>
   <div class="notice">本次查詢：${escape(plan.checked)}。地點、營業時間及照片由 <span translate="no">Google Maps</span> 提供；行程順序與時間由本網站估算，不代表已確認出遊當日營業。</div>
-  <div class="toolbar"><div class="tabs" role="tablist" aria-label="天氣情境">${Object.entries(labels).map(([k,title])=>`<button role="tab" aria-selected="${active===k}" class="${active===k?'active':''}" data-weather="${k}">${title}</button>`).join('')}</div></div>
+  <div class="toolbar"><div class="tabs" aria-label="旅遊日期">${plan.days.map((d,index)=>`<button class="${activeDay===index?'active':''}" data-day="${index}" aria-pressed="${activeDay===index}">第 ${index+1} 天 · ${escape(d.date.slice(5))}</button>`).join('')}</div></div><div class="toolbar"><div class="tabs" role="tablist" aria-label="天氣情境">${Object.entries(labels).map(([k,title])=>`<button role="tab" aria-selected="${active===k}" class="${active===k?'active':''}" data-weather="${k}">${title}</button>`).join('')}</div></div>
   <p class="form-note" style="margin-bottom:20px">${escape(strategies[active])}</p>
   ${r.available?'':`<div class="notice">這個日期或條件下沒有合適的${escape(labels[active])}。請調整日期或地點，不建議在大雨時勉強採用戶外行程。</div>`}
   <div class="timeline">${r.items.map(i=>{const p=i.place;return `<article class="stop ${p?'':'minor'}"><div class="time">${escape(i.start)}<small>至 ${escape(i.end)}</small></div><div class="stop-body"><div class="stop-head"><h3>${escape(i.name)}</h3>${p?`<span class="pill">${p.indoor?'室內候選':'戶外／混合場域'}</span>`:''}</div><p>${escape(i.description)}</p>${p?`<p class="address">${escape(p.address)}</p><p>${escape(p.hours)}</p><div class="stop-links">${link('Google Maps 導航',p.mapUrl||maps(p))}${link('查看資料來源',p.source)}</div>${photograph(p)}${p.attributions?.length?`<p class="photo-note">資料提供者：${p.attributions.map(a=>link(a.provider,a.uri)).join(' · ')}</p>`:''}`:i.search?`<div class="stop-links">${link('尋找周邊餐廳（未訂位）',i.search)}</div>`:''}</div></article>`;}).join('')}</div>
-  <div class="tips"><h3>出發前，留意這幾件事</h3><ul>${[...new Set([...r.warnings,...plan.notes])].map(n=>`<li>${escape(n)}</li>`).join('')}</ul>${r.available?`<p>餐費預留 ${r.food} 元、交通預留 ${r.transport} 元、已知門票 ${r.known} 元；${r.unknown} 站票價待查。總預算 ${o.budget.toLocaleString()} 元。</p>`:''}<p>搜尋以「${escape(plan.resolvedLocation?.name||o.destination)}」周邊約 15 公里為範圍。若地點不符，請補上縣市或完整名稱重新查詢。</p></div>`;
+  <div class="notice">${escape(labels[active])}全程預留 NT$ ${plan.totals[active].toLocaleString()}（不含住宿、購物與待查票價）。${plan.totals[active]>o.budget?'已超過全程預算，請調整條件。':''}</div><div class="tips"><h3>出發前，留意這幾件事</h3><ul>${[...new Set([...r.warnings,...plan.notes])].map(n=>`<li>${escape(n)}</li>`).join('')}</ul>${r.available?`<p>餐費預留 ${r.food} 元、交通預留 ${r.transport} 元、已知門票 ${r.known} 元；${r.unknown} 站票價待查。總預算 ${o.budget.toLocaleString()} 元。</p>`:''}<p>搜尋以「${escape(plan.resolvedLocation?.name||o.destination)}」周邊約 15 公里為範圍。若地點不符，請補上縣市或完整名稱重新查詢。</p></div>`;
+  output.querySelectorAll('[data-day]').forEach(b=>b.onclick=()=>{activeDay=Number(b.dataset.day);render();});
   output.querySelectorAll('[data-weather]').forEach(b=>b.onclick=()=>{active=b.dataset.weather;render();});
   output.querySelectorAll('.place-image img').forEach(img=>img.onerror=()=>{img.hidden=true;img.closest('figure').querySelector('figcaption').prepend(document.createTextNode('照片暫時無法載入。 '));});
 }

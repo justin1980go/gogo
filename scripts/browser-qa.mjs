@@ -11,6 +11,7 @@ const browser=await chromium.launch({channel:'msedge',headless:true});
 try{
   const page=await browser.newPage({viewport:{width:1440,height:1100}}),errors=[];
   page.on('pageerror',e=>errors.push(e.message));
+  await page.route('**/config.js',r=>r.fulfill({contentType:'text/javascript',body:'window.TRAVEL_CONFIG={apiBase:""};'}));
   await page.goto('http://127.0.0.1:4173');
   await page.getByRole('heading',{name:'先連接線上地點服務'}).waitFor();
   if(await page.locator('[data-export],input[type=file]').count())throw Error('Old download/upload controls remain');
@@ -22,7 +23,7 @@ try{
     const request=route.request();
     if(request.method()==='OPTIONS'){await route.fulfill({status:204,headers:{'Access-Control-Allow-Origin':'http://127.0.0.1:4173','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'POST,OPTIONS'}});return;}
     const data=JSON.parse(request.postData());requests.push(data.destination);
-    const api=createWorker(providerFixture({empty:data.destination==='查無結果'}).fetcher);
+    const api=createWorker(providerFixture({empty:data.destination==='查無結果',expanded:data.days>1}).fetcher);
     const response=await api.fetch(new Request('https://api.example.test/api/plan',{method:'POST',headers:{Origin:'http://127.0.0.1:4173','Content-Type':'application/json'},body:request.postData()}),env);
     await route.fulfill({status:response.status,headers:Object.fromEntries(response.headers),body:await response.text()});
   });
@@ -45,6 +46,18 @@ try{
   await page.setViewportSize({width:390,height:844});
   await page.screenshot({path:'test-output/online/mobile.png',fullPage:true});
   if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))throw Error('Mobile overflow');
+  await page.locator('[name=days]').selectOption('5');
+  await page.locator('[name=interest]').selectOption('shopping');
+  await page.locator('#generate').click();
+  await page.getByRole('heading',{name:'日月潭5 日遊',exact:true}).waitFor();
+  const beforeSwitch=requests.length;
+  await page.locator('[data-day="4"]').click();
+  if(!await page.locator('.route-cover').innerText().then(t=>t.includes('2026-10-07')))throw Error('Day selection did not update date');
+  if(await page.locator('.stop .pill').count()<1)throw Error('No fifth-day stops with sufficient candidates');
+  await page.locator('[data-weather=sun]').click();
+  if(requests.length!==beforeSwitch)throw Error('Day switch made a paid request');
+  if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))throw Error('Multi-day mobile overflow');
+  await page.screenshot({path:'test-output/online/multiday-mobile.png',fullPage:true});
   await page.locator('[name=destination]').fill('查無結果');
   if(await page.locator('.route-cover').count())throw Error('Stale result after input');
   await page.locator('#generate').click();await page.getByText('找不到台灣境內的對應地點，請補上縣市或完整景點名稱。',{exact:true}).waitFor();
