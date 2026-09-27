@@ -18,13 +18,13 @@ try{
   await page.locator('#generate').click();await page.getByText('線上查詢尚未設定。請完成 Google Places 與 Cloudflare Worker 設定，再將 Worker 網址填入 config.js。',{exact:true}).waitFor();
   await page.screenshot({path:'test-output/online/setup.png',fullPage:true});
   await page.route('**/config.js',r=>r.fulfill({contentType:'text/javascript',body:'window.TRAVEL_CONFIG={apiBase:"https://api.example.test"};'}));
-  const requests=[];
-  await page.route('https://api.example.test/api/plan',async route=>{
+  const requests=[],diningRequests=[];
+  await page.route('https://api.example.test/api/*',async route=>{
     const request=route.request();
     if(request.method()==='OPTIONS'){await route.fulfill({status:204,headers:{'Access-Control-Allow-Origin':'http://127.0.0.1:4173','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'POST,OPTIONS'}});return;}
-    const data=JSON.parse(request.postData());requests.push(data.destination);
+    const data=JSON.parse(request.postData());const isDining=request.url().endsWith('/recommendations');if(isDining)diningRequests.push(data);else requests.push(data.destination);
     const api=createWorker(providerFixture({empty:data.destination==='查無結果',expanded:data.days>1}).fetcher);
-    const response=await api.fetch(new Request('https://api.example.test/api/plan',{method:'POST',headers:{Origin:'http://127.0.0.1:4173','Content-Type':'application/json'},body:request.postData()}),env);
+    const response=await api.fetch(new Request(request.url(),{method:'POST',headers:{Origin:'http://127.0.0.1:4173','Content-Type':'application/json'},body:request.postData()}),env);
     await route.fulfill({status:response.status,headers:Object.fromEntries(response.headers),body:await response.text()});
   });
   await page.route('https://photos.example.test/**',r=>r.fulfill({contentType:'image/png',body:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=','base64')}));
@@ -39,6 +39,9 @@ try{
   }
   if(requests.join(',')!=='台中,花蓮,日月潭')throw Error('Some cities bypassed live API');
   if(!await page.locator('.place-image figcaption').first().innerText().then(t=>t.includes('測試作者')))throw Error('Attribution missing');
+  await page.locator('#recommendations .recommendation-card').first().waitFor();
+  if(await page.locator('#recommendations .recommendation-card').count()!==4)throw Error('Expected two lunch and two dinner options');
+  if(await page.locator('#recommendations').innerText().then(t=>!t.includes('Google 旅客評分 4.5 / 5')))throw Error('Missing ratings');
   await page.screenshot({path:'test-output/online/mock-result.png',fullPage:true});
   await page.locator('[data-weather=heavy]').click();
   if(await page.locator('.stop .pill').allTextContents().then(a=>a.some(s=>s!=='室內候選')))throw Error('Outdoor rainy route');
@@ -50,14 +53,31 @@ try{
   await page.locator('[name=interest]').selectOption('shopping');
   await page.locator('#generate').click();
   await page.getByRole('heading',{name:'日月潭5 日遊',exact:true}).waitFor();
+  await page.getByRole('heading',{name:'本晚住宿候選',exact:true}).waitFor();
+  if(!await page.locator('#recommendations').innerText().then(t=>t.includes('官方飯店星級')&&t.includes('民宿 1')))throw Error('Lodging recommendations missing');
+  await page.screenshot({path:'test-output/online/dining-mobile.png',fullPage:true});
+  await page.locator('#recommendations').screenshot({path:'test-output/online/dining-cards-mobile.png'});
+  const diningBefore=diningRequests.length;
+  await page.locator('[data-day="0"]').click();
+  await page.getByRole('heading',{name:'本晚住宿候選',exact:true}).waitFor();
+  if(diningRequests.length!==diningBefore)throw Error('Repeated route refetched dining');
   const beforeSwitch=requests.length;
   await page.locator('[data-day="4"]').click();
   if(!await page.locator('.route-cover').innerText().then(t=>t.includes('2026-10-07')))throw Error('Day selection did not update date');
   if(await page.locator('.stop .pill').count()<1)throw Error('No fifth-day stops with sufficient candidates');
+  await page.locator('#recommendations .recommendation-card').first().waitFor();
+  if(await page.getByRole('heading',{name:'本晚住宿候選',exact:true}).count())throw Error('Last day must not recommend overnight lodging');
   await page.locator('[data-weather=sun]').click();
   if(requests.length!==beforeSwitch)throw Error('Day switch made a paid request');
   if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))throw Error('Multi-day mobile overflow');
   await page.screenshot({path:'test-output/online/multiday-mobile.png',fullPage:true});
+  await page.route('https://api.example.test/api/recommendations',r=>r.fulfill({status:503,headers:{'Access-Control-Allow-Origin':'http://127.0.0.1:4173'},contentType:'application/json',body:JSON.stringify({error:'模擬餐宿失敗'})}));
+  await page.locator('[name=destination]').fill('台北');await page.locator('#generate').click();
+  await page.getByText('模擬餐宿失敗 原行程仍可使用。',{exact:true}).waitFor();
+  if(!await page.locator('.route-cover').count())throw Error('Dining failure discarded itinerary');
+  await page.unroute('https://api.example.test/api/recommendations');
+  await page.getByRole('button',{name:'重試餐宿查詢',exact:true}).click();
+  await page.locator('#recommendations .recommendation-card').first().waitFor();
   await page.locator('[name=destination]').fill('查無結果');
   if(await page.locator('.route-cover').count())throw Error('Stale result after input');
   await page.locator('#generate').click();await page.getByText('找不到台灣境內的對應地點，請補上縣市或完整景點名稱。',{exact:true}).waitFor();

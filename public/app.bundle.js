@@ -12,11 +12,28 @@ function validate(raw){const o={...raw,days:raw.days??1};for(const k of ['destin
 
 return {labels,strategies,maps,hm,validate};
 })();
+modules["dining"]=(()=>{
+function recommendationInput(plan,dayIndex,weather){
+  const day=plan.days[dayIndex],items=day.routes[weather].items;
+  const stops=items.filter(i=>i.place);if(!stops.length)return null;
+  const mealIndex=items.findIndex(i=>i.type==='meal'),meal=items[mealIndex];
+  const nearLunch=(mealIndex>=0?items.slice(0,mealIndex).filter(i=>i.place).at(-1):null)||stops[0],last=stops.at(-1);
+  const min=time=>Number(time.slice(0,2))*60+Number(time.slice(3));
+  const point=(stop,start,end)=>({name:stop.place.name,lat:stop.place.lat,lng:stop.place.lng,start,end});
+  const dinnerStart=Math.max(1080,min(last.end));
+  return {date:day.date,overnight:dayIndex<plan.days.length-1,lunch:point(nearLunch,meal?min(meal.start):720,meal?min(meal.end):780),dinner:point(last,dinnerStart,Math.min(1440,dinnerStart+60))};
+}
+
+return {recommendationInput};
+})();
 modules["app"]=await (async()=>{
 const {labels,strategies,maps,validate}=modules["input"];
+const {recommendationInput}=modules["dining"];
 const $=s=>document.querySelector(s),form=$('#planner'),output=$('#output'),status=$('#status');
 const config=window.TRAVEL_CONFIG||{};
 let plan=null,active='sun',activeDay=0,revision=0,controller=null;
+const recommendationCache=new Map(),recommendationControllers=new Set();
+let recommendationView=0;
 const escape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const safeUrl=v=>{try{const u=new URL(v);return u.protocol==='https:'?u.href:'#';}catch{return '#';}};
 const link=(title,url)=>`<a href="${safeUrl(url)}" target="_blank" rel="noopener noreferrer">${escape(title)} ↗</a>`;
@@ -30,7 +47,8 @@ function endpoint(){
   if(u.username||u.password||u.search||u.hash)throw Error('服務網址不可包含帳密、金鑰或查詢參數。');
   return u.href.replace(/\/$/,'');
 }
-function invalidate(){revision++;controller?.abort();controller=null;$('#generate').disabled=false;plan=null;message('');empty('準備好就出發','按「查詢並規劃」，尋找這個地點周邊的景點與室內雨備。');}
+function resetRecommendations(){recommendationView++;recommendationCache.clear();for(const c of recommendationControllers)c.abort();recommendationControllers.clear();}
+function invalidate(){revision++;controller?.abort();controller=null;resetRecommendations();$('#generate').disabled=false;plan=null;message('');empty('準備好就出發','按「查詢並規劃」，尋找這個地點周邊的景點與室內雨備。');}
 form.addEventListener('input',invalidate);form.addEventListener('change',invalidate);
 $('#date').value=new Date(Date.now()+86400000).toLocaleDateString('en-CA',{timeZone:'Asia/Taipei'});
 $('#mode').textContent=config.apiBase?'全台線上查詢':'線上服務尚未設定';
@@ -38,6 +56,7 @@ document.querySelectorAll('[data-city]').forEach(b=>b.onclick=()=>{$('#destinati
 async function generate(){
   if(!form.reportValidity())return;
   controller?.abort();const abort=new AbortController();controller=abort;const current=++revision;
+  resetRecommendations();
   plan=null;$('#generate').disabled=true;message('正在查詢地點、景點及室內雨備…');empty('正在尋找這趟旅行的路線','第一次查詢可能需要一些時間；修改條件會取消本次查詢。');
   const timer=setTimeout(()=>abort.abort('timeout'),55000);
   try{
@@ -55,6 +74,35 @@ function photograph(p){
   if(!p.image?.url)return '<p class="photo-note">此景點暫無可顯示的實景照片，可開啟 Google Maps 查看。</p>';
   return `<figure class="place-image"><img class="stop-photo" loading="lazy" src="${safeUrl(p.image.url)}" alt="${escape(p.name)}實景照片"><figcaption><span translate="no">Google Maps</span> · ${(p.image.authors||[]).map(a=>link(a.displayName||'照片作者',a.uri)).join(' · ')||'由地點服務提供'} ${link('查看地點',p.mapUrl||maps(p))}</figcaption></figure>`;
 }
+function recommendationCard(p){
+  const badge=p.stars?`官方飯店星級 ${p.stars} 星`:`Google 旅客評分 ${Number(p.rating).toFixed(1)} / 5`;
+  return `<article class="recommendation-card"><h4>${escape(p.name)}</h4><p class="rating">${badge}${p.reviews!=null?` · ${escape(p.reviews)} 則評分`:''}</p><p>距參考景點約 ${escape(p.distanceKm)} 公里（直線距離）</p><p>${escape(p.address)}</p>${p.hoursStatus?`<p>${p.hoursStatus==='open'?'一般營業時段涵蓋參考用餐時間，出發前仍請確認。':'未取得完整用餐時段資訊，請先向店家確認。'}</p><details><summary>查看一般營業時間</summary><p>${escape(p.hours)}</p></details>`:''}<div class="stop-links">${link('Google Maps',p.mapUrl)}${p.website?link('官方網站',p.website):''}${p.source?link('星級資料來源',p.source):''}</div>${p.attributions?.length?`<p>${p.attributions.map(a=>link(a.provider,a.uri)).join(' · ')}</p>`:''}</article>`;
+}
+async function loadRecommendations(){
+  const view=++recommendationView,box=$('#recommendations');
+  const input=recommendationInput(plan,activeDay,active);if(!input){box.innerHTML='';return;}
+  const key=JSON.stringify(input);
+  box.innerHTML='<h3>附近美食與住宿</h3><p role="status">正在尋找符合條件的餐廳與住宿…</p>';
+  if(!recommendationCache.has(key)){
+    const abort=new AbortController();recommendationControllers.add(abort);
+    const timer=setTimeout(()=>abort.abort(),20000);
+    const pending=(async()=>{try{
+      const response=await fetch(endpoint()+'/api/recommendations',{method:'POST',headers:{'Content-Type':'application/json'},body:key,signal:abort.signal});
+      const data=await response.json();if(!response.ok)throw Error(data.error||'餐宿服務未更新，請部署 v0.4 Worker。');
+      if(!data.lunch||!data.dinner)throw Error('請更新 Worker 至 v0.4 餐宿推薦版。');return data;
+    }catch(e){return {error:abort.signal.aborted?'餐宿查詢逾時或已取消。':e.message||'餐宿查詢暫時失敗。'};}
+    finally{clearTimeout(timer);recommendationControllers.delete(abort);}})();
+    recommendationCache.set(key,pending);
+  }
+  const data=await recommendationCache.get(key);if(view!==recommendationView||!box.isConnected)return;
+  const section=(title,items,note='')=>`<h4>${escape(title)}</h4><div class="recommendation-grid">${items.map(recommendationCard).join('')}</div>${note?`<p class="form-note">${escape(note)}</p>`:''}`;
+  if(data.error)box.innerHTML=`<h3>附近美食與住宿</h3><p>${escape(data.error)} 原行程仍可使用。</p>`;
+  else {
+    const s=data.lodging;
+    box.innerHTML=`<h3>附近美食與住宿</h3><p class="form-note">餐廳與民宿評分來自 <span translate="no">Google Maps</span>，查詢日期 ${escape(data.checked?.slice(0,10))}。餐廳距參考景點 3 公里內；營業、座位與房況請先確認。</p>${section(`午餐 · ${data.lunch.anchor}附近 · ${data.lunch.time}`,data.lunch.items,data.lunch.note)}${section(`晚餐 · ${data.dinner.anchor}附近 · 參考 ${data.dinner.time}`,data.dinner.items,data.dinner.note)}<p class="form-note">晚餐依最後一站推薦，尚未排入行程與預算；若已返家可略過，若續留用餐請延後返程並預留往返餐廳的時間。午餐移動也需另留交通餘裕。</p>${s?`<h3>本晚住宿候選</h3><p>以 ${escape(s.anchor)} 周邊 15 公里內推薦，尚未選定住宿，不會自動更動每日接駁時間。</p>${section('三星以上飯店（官方星級）',s.hotels,s.hotels.length?'':'附近暫無符合條件的官方星級飯店資料。')}<p class="form-note">資料：${link('交通部觀光署',s.source)} · 資料日期 ${escape(s.updated?.slice(0,10))}。星級與營運現況請出發前確認。</p>${section('民宿／家庭旅宿（旅客評分 4.5 分以上）',s.homestays,s.note||(!s.homestays.length?'附近暫無符合評分與類型的民宿候選。':''))}<p class="form-note">未查詢指定日期空房、房價或完成訂房，住宿費另計。飯店星級與旅客評分為不同標準。</p>`:''}`;
+  }
+  if(data.error||data.lunch?.failed||data.dinner?.failed||data.lodging?.failed){const button=document.createElement('button');button.className='outline';button.textContent='重試餐宿查詢';button.onclick=()=>{recommendationCache.delete(key);loadRecommendations();};box.append(button);}
+}
 function render(){const day=plan.days[activeDay],r=day.routes[active],o=plan.input;
   output.innerHTML=`<div class="route-cover"><div class="cover-content"><p class="eyebrow">TAIWAN / LIVE SEARCH</p><h2>${escape(plan.region.city)}${o.days===1?'一日遊':o.days+' 日遊'}</h2><p>${escape(day.date)} ${new Date(day.date+'T12:00:00+08:00').toLocaleDateString('zh-TW',{weekday:'long',timeZone:'Asia/Taipei'})} · ${o.people} 人 · ${escape(o.group)}</p><p>${escape(plan.resolvedLocation?.name||'')} ${escape(plan.resolvedLocation?.address||'')}</p></div></div>
   <div class="summary"><div><small>景點安排</small><strong>${r.items.filter(i=>i.place).length} 站</strong></div><div><small>本日結束</small><strong>${escape(r.finish||'尚無路線')}</strong></div><div><small>預留金額・非報價</small><strong>${r.available?'NT$ '+r.total.toLocaleString():'—'}</strong></div></div>
@@ -67,6 +115,7 @@ function render(){const day=plan.days[activeDay],r=day.routes[active],o=plan.inp
   output.querySelectorAll('[data-day]').forEach(b=>b.onclick=()=>{activeDay=Number(b.dataset.day);render();});
   output.querySelectorAll('[data-weather]').forEach(b=>b.onclick=()=>{active=b.dataset.weather;render();});
   output.querySelectorAll('.place-image img').forEach(img=>img.onerror=()=>{img.hidden=true;img.closest('figure').querySelector('figcaption').prepend(document.createTextNode('照片暫時無法載入。 '));});
+  const dining=document.createElement('section');dining.id='recommendations';dining.className='recommendations';dining.setAttribute('aria-label','附近美食與住宿');output.querySelector('.tips').before(dining);loadRecommendations();
 }
 if(document.modelContext?.registerTool){try{document.modelContext.registerTool({name:'read_travel_plan',description:'讀取畫面上的旅遊候選規劃，不建立訂位。',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true,untrustedContentHint:true},execute:()=>({plan,active})});}catch{}}
 empty(config.apiBase?'輸入目的地，開始查詢':'先連接線上地點服務',config.apiBase?'可輸入台灣城市、行政區或景點名稱；按下查詢後才會向服務取得資料。':'這一版使用全台線上查詢，不再使用固定四地資料。請依設定步驟啟用 Google Places 與 Cloudflare Worker。');

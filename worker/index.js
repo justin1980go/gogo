@@ -1,16 +1,21 @@
 import {buildPlan,validate,distance} from '../src/engine.js';
+import {recommendations,validateRecommendations} from './recommendations.js';
 
 const fields=['id','displayName','formattedAddress','location','types','googleMapsUri','websiteUri','regularOpeningHours','businessStatus','addressComponents','attributions','photos'].map(s=>'places.'+s).join(',');
 const allowed=(env,origin)=>Boolean(origin)&&origin!=='null'&&(env.ALLOWED_ORIGINS||'').split(',').map(s=>s.trim()).filter(Boolean).includes(origin);
-const isTaiwan=p=>p.addressComponents?.some(a=>a.types.includes('country')&&a.shortText==='TW');
+// Some address components have no type metadata. Only an explicit country
+// component establishes Taiwan; incomplete components can be skipped safely.
+const isTaiwan=p=>Array.isArray(p?.addressComponents)&&p.addressComponents.some(a=>Array.isArray(a?.types)&&a.types.includes('country')&&a.shortText==='TW');
 const isAttraction=p=>p.types?.some(t=>['tourist_attraction','museum','art_gallery','park','historical_landmark','library','national_park','botanical_garden','shopping_mall','department_store','zoo','aquarium','amusement_park'].includes(t));
 const checkedDate=()=>new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Taipei'});
 
-export async function searchPlaces(query,env,fetcher=fetch,center){
+export async function searchPlaces(query,env,fetcher=fetch,center,options={}){
   const body={textQuery:query,languageCode:'zh-TW',regionCode:'TW',pageSize:20};
-  if(center)body.locationBias={circle:{center:{latitude:center.lat,longitude:center.lng},radius:15000}};
+  if(center)body.locationBias={circle:{center:{latitude:center.lat,longitude:center.lng},radius:options.radius||15000}};
+  if(options.minRating)body.minRating=options.minRating;
+  if(options.includedType){body.includedType=options.includedType;body.strictTypeFiltering=true;}
   const response=await fetcher('https://places.googleapis.com/v1/places:searchText',{
-    method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_PLACES_API_KEY,'X-Goog-FieldMask':fields},
+    method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':env.GOOGLE_PLACES_API_KEY,'X-Goog-FieldMask':options.rated?fields.replace(',places.photos','')+',places.rating,places.userRatingCount':fields},
     body:JSON.stringify(body),signal:AbortSignal.timeout(12000)
   });
   if(!response.ok)throw Error(response.status===429?'地點服務配額暫時用盡，請稍後再試。':'地點資料服務回應失敗，請確認 API 啟用、金鑰及配額。');
@@ -91,21 +96,23 @@ export function createWorker(fetcher=fetch){return {async fetch(request,env){
   const origin=request.headers.get('Origin')||'',url=new URL(request.url);
   const cors=allowed(env,origin)?{'Access-Control-Allow-Origin':origin,'Vary':'Origin'}:{};
   const json=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store',...cors}});
-  if(url.pathname==='/health')return json({ok:true,version:'0.3.0',mode:'live-only',liveConfigured:!!env.GOOGLE_PLACES_API_KEY,rateLimitConfigured:!!env.RATE_LIMITER});
+  if(url.pathname==='/health')return json({ok:true,version:'0.4.0',mode:'live-only',liveConfigured:!!env.GOOGLE_PLACES_API_KEY,rateLimitConfigured:!!env.RATE_LIMITER});
   if(!allowed(env,origin))return json({error:'此網站尚未列入允許來源。'},403);
   if(request.method==='OPTIONS')return new Response(null,{status:204,headers:{...cors,'Access-Control-Allow-Methods':'POST, OPTIONS','Access-Control-Allow-Headers':'Content-Type','Access-Control-Max-Age':'600'}});
-  if(url.pathname!=='/api/plan')return json({error:'找不到此端點。'},404);
+  const isRecommendations=url.pathname==='/api/recommendations';
+  if(url.pathname!=='/api/plan'&&!isRecommendations)return json({error:'找不到此端點。'},404);
   if(request.method!=='POST')return json({error:'請使用 POST。'},405);
   if(!request.headers.get('Content-Type')?.startsWith('application/json'))return json({error:'請傳送 JSON 格式。'},415);
   try{
     if(Number(request.headers.get('Content-Length')||0)>8192)return json({error:'輸入資料過大。'},413);
     const reader=request.body?.getReader();let size=0,parts=[];
     if(reader)while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>8192){await reader.cancel();return json({error:'輸入資料過大。'},413);}parts.push(value);}
-    let input;try{const bytes=new Uint8Array(size);let offset=0;for(const part of parts){bytes.set(part,offset);offset+=part.length;}input=validate(JSON.parse(new TextDecoder().decode(bytes)));}
+    let input;try{const bytes=new Uint8Array(size);let offset=0;for(const part of parts){bytes.set(part,offset);offset+=part.length;}const raw=JSON.parse(new TextDecoder().decode(bytes));input=isRecommendations?validateRecommendations(raw):validate(raw);}
     catch(e){return json({error:e instanceof SyntaxError?'JSON 格式錯誤。':e.message},400);}
     if(!env.GOOGLE_PLACES_API_KEY)return json({error:'線上地點查詢尚未設定。請在 Cloudflare 設定 GOOGLE_PLACES_API_KEY。'},503);
     if(!env.RATE_LIMITER)return json({error:'線上查詢的流量限制尚未設定。'},503);
-    if(!(await env.RATE_LIMITER.limit({key:request.headers.get('CF-Connecting-IP')||'unknown'})).success)return json({error:'查詢過於頻繁，請稍後再試。'},429);
+    if(!(await env.RATE_LIMITER.limit({key:(isRecommendations?'recommendations:':'plan:')+(request.headers.get('CF-Connecting-IP')||'unknown')})).success)return json({error:'查詢過於頻繁，請稍後再試。'},429);
+    if(isRecommendations)return json(await recommendations(input,(query,center,options)=>searchPlaces(query,env,fetcher,center,options)));
     const region=await liveRegion(input,env,fetcher);
     let plan;try{plan=buildPlan(input,region);}catch(e){return json({error:e.message},422);}
     plan.resolvedLocation=region.resolvedLocation;

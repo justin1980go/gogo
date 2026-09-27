@@ -2,6 +2,22 @@ import test from 'node:test';import assert from 'node:assert/strict';
 import worker,{createWorker,searchPlaces,convertPlace} from '../worker/index.js';
 import {input,env,providerFixture} from './live-fixtures.mjs';
 const req=(body=input,origin='https://example.github.io')=>new Request('https://api.example/api/plan',{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:JSON.stringify(body)});
+
+test('地址片段缺少 types 不應中斷全程規劃，仍須有台灣國別才接受',async()=>{
+  const mock=providerFixture();
+  const fetcher=async(url,options)=>{
+    const response=await mock.fetcher(url,options);
+    if(url.includes('/media?'))return response;
+    const data=await response.json();
+    for(const p of data.places||[])p.addressComponents.unshift({longText:'未分類地址片段'},null,{types:null});
+    return Response.json(data);
+  };
+  const response=await createWorker(fetcher).fetch(req({...input,days:3,interest:'shopping'}),env);
+  assert.equal(response.status,200,await response.clone().text());
+  assert.equal((await response.json()).days.length,3);
+  const places=await searchPlaces('test',env,async()=>Response.json({places:[{location:{latitude:24,longitude:121},addressComponents:[{shortText:'TW'},{types:null,shortText:'TW'}]}]}));
+  assert.equal(places.length,0);
+});
 test('所有城市都需要線上設定，不再回傳內建四地',async()=>{for(const destination of ['台北','宜蘭','台中','台南','花蓮','日月潭'])assert.equal((await worker.fetch(req({...input,destination}),{ALLOWED_ORIGINS:env.ALLOWED_ORIGINS})).status,503);});
 test('API 拒絕錯誤來源、null 來源、超大資料及無效條件',async()=>{
   assert.equal((await worker.fetch(req(input,'https://bad.example'),env)).status,403);
