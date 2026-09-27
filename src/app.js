@@ -1,0 +1,56 @@
+import {labels,strategies,maps,validate} from './input.js';
+const $=s=>document.querySelector(s),form=$('#planner'),output=$('#output'),status=$('#status');
+const config=window.TRAVEL_CONFIG||{};
+let plan=null,active='sun',revision=0,controller=null;
+const escape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const safeUrl=v=>{try{const u=new URL(v);return u.protocol==='https:'?u.href:'#';}catch{return '#';}};
+const link=(title,url)=>`<a href="${safeUrl(url)}" target="_blank" rel="noopener noreferrer">${escape(title)} ↗</a>`;
+function message(text,error=false){status.innerHTML=text?`<div class="notice ${error?'error':''}">${escape(text)}</div>`:'';}
+function empty(title,text){output.innerHTML=`<div class="empty"><p class="eyebrow">TAIWAN / LIVE SEARCH</p><h2>${escape(title)}</h2><p>${escape(text)}</p><a href="./services.html">查看線上查詢設定步驟 ↗</a></div>`;}
+function endpoint(){
+  if(location.protocol==='file:')throw Error('全台即時查詢需要連線服務。請完成設定後使用正式網站或啟動旅遊規劃室.cmd；直接雙擊檔案可查看介面，但無法查詢。');
+  if(!config.apiBase)throw Error('線上查詢尚未設定。請完成 Google Places 與 Cloudflare Worker 設定，再將 Worker 網址填入 config.js。');
+  const u=new URL(config.apiBase);
+  if(u.protocol!=='https:'&&!['localhost','127.0.0.1'].includes(u.hostname))throw Error('查詢服務網址必須使用 HTTPS。');
+  if(u.username||u.password||u.search||u.hash)throw Error('服務網址不可包含帳密、金鑰或查詢參數。');
+  return u.href.replace(/\/$/,'');
+}
+function invalidate(){revision++;controller?.abort();controller=null;$('#generate').disabled=false;plan=null;message('');empty('準備好就出發','按「查詢並規劃」，尋找這個地點周邊的景點與室內雨備。');}
+form.addEventListener('input',invalidate);form.addEventListener('change',invalidate);
+$('#date').value=new Date(Date.now()+86400000).toLocaleDateString('en-CA',{timeZone:'Asia/Taipei'});
+$('#mode').textContent=config.apiBase?'全台線上查詢':'線上服務尚未設定';
+document.querySelectorAll('[data-city]').forEach(b=>b.onclick=()=>{$('#destination').value=b.dataset.city;invalidate();});
+async function generate(){
+  if(!form.reportValidity())return;
+  controller?.abort();const abort=new AbortController();controller=abort;const current=++revision;
+  plan=null;$('#generate').disabled=true;message('正在查詢地點、景點及室內雨備…');empty('正在尋找這趟旅行的路線','第一次查詢可能需要一些時間；修改條件會取消本次查詢。');
+  const timer=setTimeout(()=>abort.abort('timeout'),55000);
+  try{
+    const input=validate(Object.fromEntries(new FormData(form)));
+    const response=await fetch(endpoint()+'/api/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(input),signal:abort.signal});
+    let data;try{data=await response.json();}catch{throw Error('查詢服務沒有回傳有效資料，請確認 Worker 網址及部署狀態。');}
+    if(!response.ok)throw Error(data.error||'地點查詢暫時無法使用，請稍後重試。');
+    if(data.sourceMode!=='live'||!data.routes?.sun||!data.input||!data.region)throw Error('查詢服務版本不相符，請更新 Worker 至全台線上版。');
+    if(current!==revision)return;plan=data;active=Object.keys(labels).find(k=>data.routes[k]?.available)||'sun';message('');render();
+  }catch(error){if(current!==revision)return;const detail=abort.signal.reason==='timeout'?'查詢逾時，請稍後再試。':error instanceof TypeError?'無法連線到查詢服務，請檢查網路、Worker 網址及允許來源設定。':error.message;empty('這次尚未產生行程','請查看上方提示，調整條件或完成線上服務設定後再試。');message(detail,true);
+  }finally{clearTimeout(timer);if(current===revision){$('#generate').disabled=false;controller=null;}}
+}
+form.onsubmit=e=>{e.preventDefault();generate();};
+function photograph(p){
+  if(!p.image?.url)return '<p class="photo-note">此景點暫無可顯示的實景照片，可開啟 Google Maps 查看。</p>';
+  return `<figure class="place-image"><img class="stop-photo" loading="lazy" src="${safeUrl(p.image.url)}" alt="${escape(p.name)}實景照片"><figcaption><span translate="no">Google Maps</span> · ${(p.image.authors||[]).map(a=>link(a.displayName||'照片作者',a.uri)).join(' · ')||'由地點服務提供'} ${link('查看地點',p.mapUrl||maps(p))}</figcaption></figure>`;
+}
+function render(){const r=plan.routes[active],o=plan.input;
+  output.innerHTML=`<div class="route-cover"><div class="cover-content"><p class="eyebrow">TAIWAN / LIVE SEARCH</p><h2>${escape(plan.region.city)}一日遊</h2><p>${escape(o.date)} ${new Date(o.date+'T12:00:00+08:00').toLocaleDateString('zh-TW',{weekday:'long',timeZone:'Asia/Taipei'})} · ${o.people} 人 · ${escape(o.group)}</p><p>${escape(plan.resolvedLocation?.name||'')} ${escape(plan.resolvedLocation?.address||'')}</p></div></div>
+  <div class="summary"><div><small>景點安排</small><strong>${r.items.filter(i=>i.place).length} 站</strong></div><div><small>預估返家</small><strong>${escape(r.finish||'尚無路線')}</strong></div><div><small>預留金額・非報價</small><strong>${r.available?'NT$ '+r.total.toLocaleString():'—'}</strong></div></div>
+  <div class="notice">本次查詢：${escape(plan.checked)}。地點、營業時間及照片由 <span translate="no">Google Maps</span> 提供；行程順序與時間由本網站估算，不代表已確認出遊當日營業。</div>
+  <div class="toolbar"><div class="tabs" role="tablist" aria-label="天氣情境">${Object.entries(labels).map(([k,title])=>`<button role="tab" aria-selected="${active===k}" class="${active===k?'active':''}" data-weather="${k}">${title}</button>`).join('')}</div></div>
+  <p class="form-note" style="margin-bottom:20px">${escape(strategies[active])}</p>
+  ${r.available?'':`<div class="notice">這個日期或條件下沒有合適的${escape(labels[active])}。請調整日期或地點，不建議在大雨時勉強採用戶外行程。</div>`}
+  <div class="timeline">${r.items.map(i=>{const p=i.place;return `<article class="stop ${p?'':'minor'}"><div class="time">${escape(i.start)}<small>至 ${escape(i.end)}</small></div><div class="stop-body"><div class="stop-head"><h3>${escape(i.name)}</h3>${p?`<span class="pill">${p.indoor?'室內候選':'戶外／混合場域'}</span>`:''}</div><p>${escape(i.description)}</p>${p?`<p class="address">${escape(p.address)}</p><p>${escape(p.hours)}</p><div class="stop-links">${link('Google Maps 導航',p.mapUrl||maps(p))}${link('查看資料來源',p.source)}</div>${photograph(p)}${p.attributions?.length?`<p class="photo-note">資料提供者：${p.attributions.map(a=>link(a.provider,a.uri)).join(' · ')}</p>`:''}`:i.search?`<div class="stop-links">${link('尋找周邊餐廳（未訂位）',i.search)}</div>`:''}</div></article>`;}).join('')}</div>
+  <div class="tips"><h3>出發前，留意這幾件事</h3><ul>${[...new Set([...r.warnings,...plan.notes])].map(n=>`<li>${escape(n)}</li>`).join('')}</ul>${r.available?`<p>餐費預留 ${r.food} 元、交通預留 ${r.transport} 元、已知門票 ${r.known} 元；${r.unknown} 站票價待查。總預算 ${o.budget.toLocaleString()} 元。</p>`:''}<p>搜尋以「${escape(plan.resolvedLocation?.name||o.destination)}」周邊約 15 公里為範圍。若地點不符，請補上縣市或完整名稱重新查詢。</p></div>`;
+  output.querySelectorAll('[data-weather]').forEach(b=>b.onclick=()=>{active=b.dataset.weather;render();});
+  output.querySelectorAll('.place-image img').forEach(img=>img.onerror=()=>{img.hidden=true;img.closest('figure').querySelector('figcaption').prepend(document.createTextNode('照片暫時無法載入。 '));});
+}
+if(document.modelContext?.registerTool){try{document.modelContext.registerTool({name:'read_travel_plan',description:'讀取畫面上的旅遊候選規劃，不建立訂位。',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true,untrustedContentHint:true},execute:()=>({plan,active})});}catch{}}
+empty(config.apiBase?'輸入目的地，開始查詢':'先連接線上地點服務',config.apiBase?'可輸入台灣城市、行政區或景點名稱；按下查詢後才會向服務取得資料。':'這一版使用全台線上查詢，不再使用固定四地資料。請依設定步驟啟用 Google Places 與 Cloudflare Worker。');
